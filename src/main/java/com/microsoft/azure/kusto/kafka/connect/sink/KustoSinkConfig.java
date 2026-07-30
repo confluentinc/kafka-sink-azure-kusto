@@ -346,7 +346,9 @@ public class KustoSinkConfig extends AbstractConfig {
                                 KustoAuthenticationStrategy.AZ_DEV_TOKEN.name(),
                                 KustoAuthenticationStrategy.AZ_DEV_TOKEN.name().toLowerCase(Locale.ENGLISH),
                                 KustoAuthenticationStrategy.WORKLOAD_IDENTITY.name(),
-                                KustoAuthenticationStrategy.WORKLOAD_IDENTITY.name().toLowerCase(Locale.ENGLISH)),
+                                KustoAuthenticationStrategy.WORKLOAD_IDENTITY.name().toLowerCase(Locale.ENGLISH),
+                                KustoAuthenticationStrategy.CUSTOM_TOKEN_CREDENTIAL.name(),
+                                KustoAuthenticationStrategy.CUSTOM_TOKEN_CREDENTIAL.name().toLowerCase(Locale.ENGLISH)),
                         Importance.HIGH,
                         KUSTO_AUTH_STRATEGY_DOC,
                         connectionGroupName,
@@ -501,6 +503,6 @@ public class KustoSinkConfig extends AbstractConfig {
     }
 
     public enum KustoAuthenticationStrategy {
-        APPLICATION, MANAGED_IDENTITY, AZ_DEV_TOKEN, WORKLOAD_IDENTITY
+        APPLICATION, MANAGED_IDENTITY, AZ_DEV_TOKEN, WORKLOAD_IDENTITY, CUSTOM_TOKEN_CREDENTIAL
     }
 }
