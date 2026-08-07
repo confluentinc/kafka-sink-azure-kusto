@@ -1,16 +1,19 @@
 package com.microsoft.azure.kusto.kafka.connect.sink;
 
+import com.azure.core.credential.TokenCredential;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.microsoft.azure.kusto.data.StringUtils;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import org.apache.commons.io.FileUtils;
+import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
@@ -30,6 +33,7 @@ public class KustoSinkConfig extends AbstractConfig {
     static final String KUSTO_AUTH_APPKEY_CONF = "aad.auth.appkey";
     static final String KUSTO_AUTH_AUTHORITY_CONF = "aad.auth.authority";
     static final String KUSTO_AUTH_STRATEGY_CONF = "aad.auth.strategy";
+    static final String KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF = "credentials.provider.class";
     static final String KUSTO_TABLES_MAPPING_CONF = "kusto.tables.topics.mapping";
     static final String KUSTO_SINK_TEMP_DIR_CONF = "tempdir.path";
     static final String KUSTO_SINK_FLUSH_SIZE_BYTES_CONF = "flush.size.bytes";
@@ -43,6 +47,12 @@ public class KustoSinkConfig extends AbstractConfig {
     static final String KUSTO_SINK_RETRY_BACKOFF_TIME_MS_CONF = "errors.retry.backoff.time.ms";
     static final String KUSTO_SINK_ENABLE_TABLE_VALIDATION = "kusto.validation.table.enable";
     private static final String DLQ_PROPS_PREFIX = "misc.deadletterqueue.";
+    /**
+     * Scope the credentials provider must mint its token for. Declared here rather than referencing
+     * the provider library's own constant so that this connector keeps compiling and running without
+     * that library on the classpath — the provider is only ever loaded reflectively.
+     */
+    private static final String AZURE_TOKEN_SCOPE_CONF = "azure.token.scope";
 
     private static final String KUSTO_INGEST_URL_DOC = "Kusto ingestion endpoint URL.";
     private static final String KUSTO_INGEST_URL_DISPLAY = "Kusto cluster ingestion URL";
@@ -63,6 +73,11 @@ public class KustoSinkConfig extends AbstractConfig {
     private static final String KUSTO_AUTH_AUTHORITY_DISPLAY = "Kusto Auth Authority";
     private static final String KUSTO_AUTH_STRATEGY_DOC = "Strategy to authenticate against Azure Active Directory, either ``application`` (default) or ``managed_identity``.";
     private static final String KUSTO_AUTH_STRATEGY_DISPLAY = "Kusto Auth Strategy";
+    private static final String KUSTO_CREDENTIALS_PROVIDER_CLASS_DOC = "Fully qualified name of a class implementing "
+            + "``com.azure.core.credential.TokenCredential`` and ``org.apache.kafka.common.Configurable``, used to obtain "
+            + "Microsoft Entra ID tokens when ``aad.auth.strategy`` is ``custom_token_credential``. Instantiated "
+            + "reflectively and configured with the connector's original configuration.";
+    private static final String KUSTO_CREDENTIALS_PROVIDER_CLASS_DISPLAY = "Credentials Provider Class";
     private static final String KUSTO_TABLES_MAPPING_DOC = """
             A JSON array mapping ingestion from topic to table, e.g: \
             [{'topic':'topic1','db':'kustoDb', 'table': 'table1', 'format': 'csv', 'mapping': 'csvMapping', 'streaming': 'false'}..].
@@ -115,6 +130,7 @@ public class KustoSinkConfig extends AbstractConfig {
     public KustoSinkConfig(ConfigDef config, Map<String, String> parsedConfig) {
         super(config, parsedConfig);
         validateEndpointUrls();
+        validateAuthStrategyExclusivity();
     }
 
     public KustoSinkConfig(Map<String, String> parsedConfig) {
@@ -133,6 +149,49 @@ public class KustoSinkConfig extends AbstractConfig {
         if (StringUtils.isNotBlank(engineUrl)) {
             KustoEndpointUrlValidator.validateEndpointUrl(engineUrl, KUSTO_ENGINE_URL_CONF);
         }
+    }
+
+    /**
+     * The custom token-credential strategy mints tokens from an external identity, so none of the
+     * static credential configs may be set alongside it — and conversely a provider class is
+     * meaningless unless that strategy was selected. Checked here so a misconfiguration fails at
+     * validation time rather than on the first ingestion attempt.
+     */
+    private void validateAuthStrategyExclusivity() {
+        boolean hasProviderClass = StringUtils.isNotBlank(getCredentialsProviderClass());
+        if (getAuthStrategy() != KustoAuthenticationStrategy.CUSTOM_TOKEN_CREDENTIAL) {
+            if (hasProviderClass) {
+                throw new ConfigException(String.format(
+                        "`%s` is only supported when `%s` is `%s`.",
+                        KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, KUSTO_AUTH_STRATEGY_CONF,
+                        KustoAuthenticationStrategy.CUSTOM_TOKEN_CREDENTIAL.name().toLowerCase(Locale.ENGLISH)));
+            }
+            return;
+        }
+
+        if (!hasProviderClass) {
+            throw new ConfigException(String.format(
+                    "`%s` must be set when `%s` is `%s`.",
+                    KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, KUSTO_AUTH_STRATEGY_CONF,
+                    KustoAuthenticationStrategy.CUSTOM_TOKEN_CREDENTIAL.name().toLowerCase(Locale.ENGLISH)));
+        }
+
+        List<String> conflicting = Arrays.asList(KUSTO_AUTH_APPID_CONF, KUSTO_AUTH_APPKEY_CONF,
+                KUSTO_AUTH_ACCESS_TOKEN_CONF, KUSTO_AUTH_AUTHORITY_CONF)
+                .stream()
+                .filter(this::isConfigured)
+                .toList();
+        if (!conflicting.isEmpty()) {
+            throw new ConfigException(String.format(
+                    "%s cannot be configured together with `%s` `%s`. Please configure only one authentication method.",
+                    conflicting, KUSTO_AUTH_STRATEGY_CONF,
+                    KustoAuthenticationStrategy.CUSTOM_TOKEN_CREDENTIAL.name().toLowerCase(Locale.ENGLISH)));
+        }
+    }
+
+    private boolean isConfigured(String configName) {
+        Object value = originals().get(configName);
+        return value != null && StringUtils.isNotBlank(value.toString());
     }
 
     public static ConfigDef getConfig() {
@@ -356,6 +415,16 @@ public class KustoSinkConfig extends AbstractConfig {
                         Width.MEDIUM,
                         KUSTO_AUTH_STRATEGY_DISPLAY)
                 .define(
+                        KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF,
+                        Type.STRING,
+                        "",
+                        Importance.LOW,
+                        KUSTO_CREDENTIALS_PROVIDER_CLASS_DOC,
+                        connectionGroupName,
+                        connectionGroupOrder++,
+                        Width.LONG,
+                        KUSTO_CREDENTIALS_PROVIDER_CLASS_DISPLAY)
+                .define(
                         KUSTO_CONNECTION_PROXY_HOST,
                         Type.STRING,
                         null,
@@ -403,6 +472,44 @@ public class KustoSinkConfig extends AbstractConfig {
 
     public KustoAuthenticationStrategy getAuthStrategy() {
         return KustoAuthenticationStrategy.valueOf(getString(KUSTO_AUTH_STRATEGY_CONF).toUpperCase(Locale.ENGLISH));
+    }
+
+    public String getCredentialsProviderClass() {
+        return getString(KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF);
+    }
+
+    /**
+     * Loads the configured credentials provider and hands it the connector's original configuration,
+     * so that provider-specific settings the connector itself knows nothing about are passed through.
+     * <p>
+     * The token scope is pinned to {@code clusterUrl} rather than left to the caller: providers of
+     * this kind serve a single pre-configured scope and ignore the scope the Kusto SDK asks for, and
+     * the ingestion and query endpoints are distinct resources needing distinct tokens. Each endpoint
+     * therefore gets its own provider instance.
+     *
+     * @param clusterUrl the Kusto endpoint this credential will authenticate against
+     */
+    public TokenCredential createTokenCredential(String clusterUrl) {
+        String providerClassName = getCredentialsProviderClass();
+        try {
+            Class<?> providerClass = Class.forName(providerClassName);
+            if (!TokenCredential.class.isAssignableFrom(providerClass)) {
+                throw new ConfigException(String.format("`%s` must implement %s: %s",
+                        KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, TokenCredential.class.getName(), providerClassName));
+            }
+            if (!Configurable.class.isAssignableFrom(providerClass)) {
+                throw new ConfigException(String.format("`%s` must implement %s: %s",
+                        KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, Configurable.class.getName(), providerClassName));
+            }
+            Object provider = providerClass.getDeclaredConstructor().newInstance();
+            Map<String, Object> providerConfig = new HashMap<>(originals());
+            providerConfig.put(AZURE_TOKEN_SCOPE_CONF, "%s/.default".formatted(clusterUrl));
+            ((Configurable) provider).configure(providerConfig);
+            return (TokenCredential) provider;
+        } catch (ReflectiveOperationException e) {
+            throw new ConfigException(String.format("Failed to instantiate `%s` `%s`: %s",
+                    KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, providerClassName, e.getMessage()), e);
+        }
     }
 
     public String getRawTopicToTableMapping() {

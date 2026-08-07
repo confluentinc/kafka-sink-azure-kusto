@@ -1,7 +1,6 @@
 package com.microsoft.azure.kusto.kafka.connect.sink;
 
 import com.azure.core.credential.AccessToken;
-import com.azure.core.credential.TokenCredential;
 import com.azure.core.credential.TokenRequestContext;
 import com.azure.core.http.ProxyOptions;
 import com.azure.identity.WorkloadIdentityCredential;
@@ -26,7 +25,6 @@ import java.util.concurrent.CountDownLatch;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
-import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -124,37 +122,11 @@ public class KustoSinkTask extends SinkTask {
                         clusterUrl,
                         config.getAuthAccessToken());
                 break;
-            case CUSTOM_TOKEN_CREDENTIAL: {
-                // Load the TokenCredential named by credentials.provider.class and hand it to the SDK.
-                final String credentialsProviderClass = Optional
-                        .ofNullable(config.originals().get("credentials.provider.class"))
-                        .map(Object::toString).map(String::trim).orElse("");
-                if (credentialsProviderClass.isEmpty()) {
-                    throw new ConfigException(
-                            "credentials.provider.class must be set for the custom token-credential auth strategy.");
-                }
-                // Per-cluster scope; the provider uses this configured value, not the SDK's requested scope.
-                final String providerScope = "%s/.default".formatted(clusterUrl);
-                final Map<String, Object> providerConfig = new HashMap<>(config.originals());
-                providerConfig.put("azure.token.scope", providerScope);
-                try {
-                    final Object provider = Class.forName(credentialsProviderClass)
-                            .getDeclaredConstructor().newInstance();
-                    if (provider instanceof Configurable) {
-                        ((Configurable) provider).configure(providerConfig);
-                    }
-                    if (!(provider instanceof TokenCredential)) {
-                        throw new ConfigException(credentialsProviderClass
-                                + " must implement com.azure.core.credential.TokenCredential.");
-                    }
-                    kcsb = ConnectionStringBuilder.createWithTokenCredential(
-                            clusterUrl, (TokenCredential) provider);
-                } catch (ReflectiveOperationException e) {
-                    throw new ConnectException(
-                            "Failed to load credentials.provider.class '" + credentialsProviderClass + "'", e);
-                }
+            case CUSTOM_TOKEN_CREDENTIAL:
+                kcsb = ConnectionStringBuilder.createWithTokenCredential(
+                        clusterUrl,
+                        config.createTokenCredential(clusterUrl));
                 break;
-            }
             default:
                 throw new ConfigException("Failed to initialize KustoIngestClient, please " +
                         "provide valid credentials. Either Kusto managed identity or " +
