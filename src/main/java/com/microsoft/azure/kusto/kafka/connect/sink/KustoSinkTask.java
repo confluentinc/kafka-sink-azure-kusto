@@ -224,7 +224,7 @@ public class KustoSinkTask extends SinkTask {
      * @param config       Kusto Sink configuration
      */
     private static void validateTableAccess(Client engineClient, @NotNull TopicToTableMapping mapping,
-            KustoSinkConfig config, List<String> databaseTableErrorList,
+            String principalFqn, List<String> databaseTableErrorList,
             List<String> accessErrorList) {
         String database = mapping.getDb();
         String table = mapping.getTable();
@@ -264,32 +264,31 @@ public class KustoSinkTask extends SinkTask {
             }
 
             if (hasAccess) {
-                // TODO check this for managed identity
-                if (StringUtils.isEmpty(config.getAuthAppId()) || StringUtils.isEmpty(config.getAuthAuthority())) {
-                    throw new ConfigException("Authority ID and Application ID must be provided to validate table accesses.");
-                }
-
-                String authenticateWith = "aadapp=%s;%s".formatted(config.getAuthAppId(),
-                        config.getAuthAuthority());
-                String query = FETCH_PRINCIPAL_ROLES_COMMAND.formatted(authenticateWith, database, table);
-                try {
-                    KustoOperationResult rs = engineClient.executeMgmt(database, query);
-                    hasAccess = (boolean) ListUtils.getFirst(rs.getPrimaryResults().getData()).get(INGESTION_ALLOWED_INDEX);
-                    if (hasAccess) {
-                        log.info("User has appropriate permissions to sink data into the Kusto table={}", table);
-                    } else {
-                        accessErrorList.add(String.format("User does not have appropriate permissions " +
-                                "to sink data into the Kusto database %s", database));
-                    }
-                } catch (DataServiceException e) {
-                    // Logging the error so that the trace is not lost.
-                    if (!e.getCause().toString().contains("Forbidden")) {
-                        databaseTableErrorList.add(
-                                "Fetching principal roles using query '%s' resulted in exception '%s'".formatted(query, getStackTraceAsString(e)));
-                    } else {
-                        log.warn(
-                                "Failed to check permissions with query '{}', will continue the run as the principal might still be able to ingest",
-                                query, e);
+                if (principalFqn == null) {
+                    log.warn("Could not resolve the current principal; skipping the ingest permission pre-check "
+                            + "for database '{}' table '{}'. Permission problems (if any) will surface at ingestion time.",
+                            database, table);
+                } else {
+                    String query = FETCH_PRINCIPAL_ROLES_COMMAND.formatted(principalFqn, database, table);
+                    try {
+                        KustoOperationResult rs = engineClient.executeMgmt(database, query);
+                        hasAccess = (boolean) ListUtils.getFirst(rs.getPrimaryResults().getData()).get(INGESTION_ALLOWED_INDEX);
+                        if (hasAccess) {
+                            log.info("User has appropriate permissions to sink data into the Kusto table={}", table);
+                        } else {
+                            accessErrorList.add(String.format("User does not have appropriate permissions " +
+                                    "to sink data into the Kusto database %s", database));
+                        }
+                    } catch (DataServiceException e) {
+                        // Logging the error so that the trace is not lost.
+                        if (!e.getCause().toString().contains("Forbidden")) {
+                            databaseTableErrorList.add(
+                                    "Fetching principal roles using query '%s' resulted in exception '%s'".formatted(query, getStackTraceAsString(e)));
+                        } else {
+                            log.warn(
+                                    "Failed to check permissions with query '{}', will continue the run as the principal might still be able to ingest",
+                                    query, e);
+                        }
                     }
                 }
             }
@@ -301,6 +300,32 @@ public class KustoSinkTask extends SinkTask {
 
         } catch (KustoDataExceptionBase e) {
             throw new ConnectException("Unable to connect to ADX(Kusto) instance", e);
+        }
+    }
+
+    /**
+     * Determines the fully-qualified principal name to check ingest access for. Application (app-secret)
+     * auth knows its own app id + authority from config. Token-credential based strategies (managed
+     * identity, workload identity, custom token credential) authenticate through an opaque credential and
+     * have no app id in config, so we ask Kusto for the caller's own identity via {@code current_principal()},
+     * which returns a native principal FQN (e.g. {@code aadapp=<id>;<tenant>}) the engine is guaranteed to
+     * accept. Returns {@code null} if the FQN cannot be determined, in which case the caller skips the
+     * ingest pre-check rather than failing task start.
+     */
+    // package-private for unit tests
+    static String resolvePrincipalFqn(Client engineClient, String database, KustoSinkConfig config) {
+        if (config.getAuthStrategy() == KustoSinkConfig.KustoAuthenticationStrategy.APPLICATION
+                && StringUtils.isNotBlank(config.getAuthAppId()) && StringUtils.isNotBlank(config.getAuthAuthority())) {
+            return "aadapp=%s;%s".formatted(config.getAuthAppId(), config.getAuthAuthority());
+        }
+        try {
+            KustoOperationResult rs = engineClient.executeQuery(database, "print fqn = current_principal()");
+            Object fqn = ListUtils.getFirst(ListUtils.getFirst(rs.getPrimaryResults().getData()));
+            String fqnStr = fqn == null ? null : fqn.toString();
+            return StringUtils.isBlank(fqnStr) ? null : fqnStr;
+        } catch (Exception e) {
+            log.warn("Failed to resolve current_principal() for the ingest permission pre-check", e);
+            return null;
         }
     }
 
@@ -353,8 +378,12 @@ public class KustoSinkTask extends SinkTask {
             if (config.getTopicToTableMapping() != null) {
                 TopicToTableMapping[] mappings = config.getTopicToTableMapping();
                 if (enableTableValidation && mappings.length > 0 && (isIngestorRole(mappings[0], engineClient))) {
+                    // Resolve the caller's principal once (it's identical across all mappings). App-secret auth
+                    // knows its app id/authority from config; token-credential strategies (managed/workload
+                    // identity, custom token credential) do not, so we ask Kusto via current_principal().
+                    String principalFqn = resolvePrincipalFqn(engineClient, mappings[0].getDb(), config);
                     for (TopicToTableMapping mapping : mappings) {
-                        validateTableAccess(engineClient, mapping, config, databaseTableErrorList, accessErrorList);
+                        validateTableAccess(engineClient, mapping, principalFqn, databaseTableErrorList, accessErrorList);
                     }
                 }
             }
