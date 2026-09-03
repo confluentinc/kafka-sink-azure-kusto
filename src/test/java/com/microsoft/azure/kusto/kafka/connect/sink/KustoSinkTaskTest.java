@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 import com.microsoft.azure.kusto.data.Client;
+import com.microsoft.azure.kusto.data.KustoOperationResult;
+import com.microsoft.azure.kusto.data.KustoResultSetTable;
 import com.microsoft.azure.kusto.ingest.IngestClient;
 import com.microsoft.azure.kusto.ingest.IngestionProperties;
 import java.io.File;
@@ -226,6 +228,61 @@ public class KustoSinkTaskTest {
         kustoSinkTaskSpy.start(configs);
         KustoSinkConfig kustoSinkConfig = new KustoSinkConfig(configs);
         assertThrows(ConnectException.class, () -> kustoSinkTask.validateTableMappings(kustoSinkConfig));
+    }
+
+    @Test
+    public void resolvePrincipalFqnUsesConfigForServicePrincipalAuth() {
+        // App-secret (APPLICATION) auth knows its own principal from config — resolved without a server call.
+        KustoSinkConfig config = new KustoSinkConfig(KustoSinkConnectorConfigTest.setupConfigs());
+        Client engineClient = mock(Client.class);
+
+        String fqn = KustoSinkTask.resolvePrincipalFqn(engineClient, "db1", config);
+
+        assertEquals("aadapp=some-appid;some-authority", fqn);
+        verifyNoInteractions(engineClient);
+    }
+
+    @Test
+    public void resolvePrincipalFqnAsksServerUnderCustomTokenCredential() throws Exception {
+        // custom_token_credential has no app id/authority in config, so the principal must be resolved from
+        // the server via current_principal() — this is the path that previously threw ConfigException.
+        KustoSinkConfig config = new KustoSinkConfig(tokenCredentialConfigs());
+        Client engineClient = mock(Client.class);
+        KustoOperationResult result = operationResultReturning("aadapp=app-1;tenant-1");
+        when(engineClient.executeQuery("db1", "print fqn = current_principal()")).thenReturn(result);
+
+        String fqn = KustoSinkTask.resolvePrincipalFqn(engineClient, "db1", config);
+
+        assertEquals("aadapp=app-1;tenant-1", fqn);
+    }
+
+    @Test
+    public void resolvePrincipalFqnReturnsNullWhenCurrentPrincipalIsBlank() throws Exception {
+        // A blank FQN must map to null so the caller skips the pre-check rather than building principal=''.
+        KustoSinkConfig config = new KustoSinkConfig(tokenCredentialConfigs());
+        Client engineClient = mock(Client.class);
+        KustoOperationResult result = operationResultReturning("");
+        when(engineClient.executeQuery("db1", "print fqn = current_principal()")).thenReturn(result);
+
+        assertNull(KustoSinkTask.resolvePrincipalFqn(engineClient, "db1", config));
+    }
+
+    private static HashMap<String, String> tokenCredentialConfigs() {
+        HashMap<String, String> configs = KustoSinkConnectorConfigTest.setupConfigs();
+        configs.remove(KustoSinkConfig.KUSTO_AUTH_APPID_CONF);
+        configs.remove(KustoSinkConfig.KUSTO_AUTH_APPKEY_CONF);
+        configs.remove(KustoSinkConfig.KUSTO_AUTH_AUTHORITY_CONF);
+        configs.put(KustoSinkConfig.KUSTO_AUTH_STRATEGY_CONF, "custom_token_credential");
+        configs.put(KustoSinkConfig.KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, "com.example.FakeTokenCredential");
+        return configs;
+    }
+
+    private static KustoOperationResult operationResultReturning(String fqn) {
+        KustoOperationResult result = mock(KustoOperationResult.class);
+        KustoResultSetTable table = mock(KustoResultSetTable.class);
+        when(table.getData()).thenReturn(Collections.singletonList(Collections.singletonList((Object) fqn)));
+        when(result.getPrimaryResults()).thenReturn(table);
+        return result;
     }
 
     @Test

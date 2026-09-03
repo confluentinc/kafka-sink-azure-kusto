@@ -3,15 +3,22 @@ package com.microsoft.azure.kusto.kafka.connect.sink;
 import static com.microsoft.azure.kusto.kafka.connect.sink.KustoSinkConfig.KUSTO_SINK_ENABLE_TABLE_VALIDATION;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import com.azure.core.credential.AccessToken;
+import com.azure.core.credential.TokenCredential;
+import com.azure.core.credential.TokenRequestContext;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.microsoft.azure.kusto.data.auth.ConnectionStringBuilder;
 import com.microsoft.azure.kusto.kafka.connect.sink.KustoSinkConfig.BehaviorOnError;
+import java.time.OffsetDateTime;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
+import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.config.ConfigException;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Mono;
 
 public class KustoSinkConnectorConfigTest {
     private static final String DM_URL = "https://ingest-cluster_name.kusto.windows.net";
@@ -274,6 +281,122 @@ public class KustoSinkConnectorConfigTest {
         Assertions.assertEquals("mydb", mappings[0].getDb());
         Assertions.assertEquals("mytable", mappings[0].getTable());
         Assertions.assertEquals("mymapping", mappings[0].getMapping());
+    }
+
+    @Test
+    public void shouldBuildConnectionStringFromCredentialsProvider() {
+        HashMap<String, String> settings = setupCustomTokenCredentialConfigs();
+        KustoSinkConfig config = new KustoSinkConfig(settings);
+
+        ConnectionStringBuilder kcsb = KustoSinkTask.createKustoEngineConnectionString(config, ENGINE_URL);
+
+        Assertions.assertInstanceOf(TestTokenCredential.class, kcsb.getCustomTokenCredential());
+    }
+
+    @Test
+    public void shouldPinTokenScopeToTheClusterBeingAuthenticatedAgainst() {
+        HashMap<String, String> settings = setupCustomTokenCredentialConfigs();
+        // The scope handed to the provider must follow the endpoint, not whatever was configured:
+        // ingestion and query endpoints are separate resources needing separate tokens.
+        settings.put("azure.token.scope", "https://management.azure.com/.default");
+        KustoSinkConfig config = new KustoSinkConfig(settings);
+
+        TestTokenCredential dmCredential = (TestTokenCredential) config.createTokenCredential(DM_URL);
+        TestTokenCredential engineCredential = (TestTokenCredential) config.createTokenCredential(ENGINE_URL);
+
+        Assertions.assertEquals(DM_URL + "/.default", dmCredential.configuredScope());
+        Assertions.assertEquals(ENGINE_URL + "/.default", engineCredential.configuredScope());
+    }
+
+    @Test
+    public void shouldPassThroughProviderSpecificConfigs() {
+        HashMap<String, String> settings = setupCustomTokenCredentialConfigs();
+        settings.put("k8s.namespace", "some-namespace");
+        KustoSinkConfig config = new KustoSinkConfig(settings);
+
+        TestTokenCredential credential = (TestTokenCredential) config.createTokenCredential(DM_URL);
+
+        Assertions.assertEquals("some-namespace", credential.configuredValue("k8s.namespace"));
+    }
+
+    @Test
+    public void shouldThrowExceptionWhenProviderClassGivenWithoutCustomTokenCredentialStrategy() {
+        HashMap<String, String> settings = setupConfigs();
+        settings.put(KustoSinkConfig.KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, TestTokenCredential.class.getName());
+        Assertions.assertThrows(ConfigException.class, () -> new KustoSinkConfig(settings));
+    }
+
+    @Test
+    public void shouldThrowExceptionWhenProviderClassMissingForCustomTokenCredentialStrategy() {
+        HashMap<String, String> settings = setupCustomTokenCredentialConfigs();
+        settings.remove(KustoSinkConfig.KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF);
+        Assertions.assertThrows(ConfigException.class, () -> new KustoSinkConfig(settings));
+    }
+
+    @Test
+    public void shouldThrowExceptionWhenStaticCredentialsGivenAlongsideCustomTokenCredential() {
+        for (String conflicting : Arrays.asList(KustoSinkConfig.KUSTO_AUTH_APPID_CONF,
+                KustoSinkConfig.KUSTO_AUTH_APPKEY_CONF, KustoSinkConfig.KUSTO_AUTH_AUTHORITY_CONF,
+                KustoSinkConfig.KUSTO_AUTH_ACCESS_TOKEN_CONF)) {
+            HashMap<String, String> settings = setupCustomTokenCredentialConfigs();
+            settings.put(conflicting, "some-value");
+            Assertions.assertThrows(ConfigException.class, () -> new KustoSinkConfig(settings),
+                    "Expected " + conflicting + " to conflict with custom token-credential authentication");
+        }
+    }
+
+    @Test
+    public void shouldThrowExceptionWhenProviderClassDoesNotImplementTokenCredential() {
+        HashMap<String, String> settings = setupCustomTokenCredentialConfigs();
+        settings.put(KustoSinkConfig.KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, String.class.getName());
+        KustoSinkConfig config = new KustoSinkConfig(settings);
+        Assertions.assertThrows(ConfigException.class, () -> config.createTokenCredential(DM_URL));
+    }
+
+    @Test
+    public void shouldThrowExceptionWhenProviderClassIsNotOnTheClasspath() {
+        HashMap<String, String> settings = setupCustomTokenCredentialConfigs();
+        settings.put(KustoSinkConfig.KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, "com.example.NoSuchProvider");
+        KustoSinkConfig config = new KustoSinkConfig(settings);
+        Assertions.assertThrows(ConfigException.class, () -> config.createTokenCredential(DM_URL));
+    }
+
+    /**
+     * Stands in for the credentials provider supplied by the platform, which is loaded reflectively
+     * and so is not on this repo's classpath.
+     */
+    public static class TestTokenCredential implements TokenCredential, Configurable {
+        private Map<String, ?> configs;
+
+        @Override
+        public void configure(Map<String, ?> configs) {
+            this.configs = configs;
+        }
+
+        String configuredScope() {
+            return configuredValue("azure.token.scope");
+        }
+
+        String configuredValue(String key) {
+            Object value = configs.get(key);
+            return value == null ? null : value.toString();
+        }
+
+        @Override
+        public Mono<AccessToken> getToken(TokenRequestContext request) {
+            return Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1)));
+        }
+    }
+
+    private static HashMap<String, String> setupCustomTokenCredentialConfigs() {
+        HashMap<String, String> configs = setupConfigs();
+        configs.remove(KustoSinkConfig.KUSTO_AUTH_APPID_CONF);
+        configs.remove(KustoSinkConfig.KUSTO_AUTH_APPKEY_CONF);
+        configs.remove(KustoSinkConfig.KUSTO_AUTH_AUTHORITY_CONF);
+        configs.put(KustoSinkConfig.KUSTO_AUTH_STRATEGY_CONF,
+                KustoSinkConfig.KustoAuthenticationStrategy.CUSTOM_TOKEN_CREDENTIAL.name());
+        configs.put(KustoSinkConfig.KUSTO_CREDENTIALS_PROVIDER_CLASS_CONF, TestTokenCredential.class.getName());
+        return configs;
     }
 
     public static HashMap<String, String> setupConfigs() {
