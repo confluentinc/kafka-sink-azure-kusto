@@ -160,15 +160,18 @@ public class TopicPartitionWriter {
                 UUID ingestionSourceId = status.getIngestionSourceId();
                 log.warn("""
                         A batch of streaming records has {} ingestion: table:{}, database:{}, operationId: {},\
-                        ingestionSourceId: {}{}{}.
+                        ingestionSourceId: {}{}.
                         Status is final and therefore ingestion won't be retried and data won't reach dlq""",
                         status.getStatus(),
                         status.getTable(),
                         status.getDatabase(),
                         status.getOperationId(),
                         ingestionSourceId,
-                        (StringUtils.isNotBlank(failureStatus) ? (", failure: " + failureStatus) : ""),
-                        (StringUtils.isNotBlank(details) ? (", details: " + details) : ""));
+                        (StringUtils.isNotBlank(failureStatus) ? (", failure: " + failureStatus) : ""));
+                if (StringUtils.isNotBlank(details) && log.isDebugEnabled()) {
+                    log.debug("Ingestion failure details for operationId: {}, ingestionSourceId: {}: {}",
+                            status.getOperationId(), ingestionSourceId, details);
+                }
                 return true;
             case Failed:
         }
@@ -262,7 +265,9 @@ public class TopicPartitionWriter {
         if (BehaviorOnError.FAIL == behaviorOnError) {
             throw new ConnectException(FILE_EXCEPTION_MESSAGE, ex);
         } else if (BehaviorOnError.LOG == behaviorOnError) {
-            log.error(FILE_EXCEPTION_MESSAGE, ex);
+            log.error("{} exceptionType={}, topic={}, partition={}, offset={}", FILE_EXCEPTION_MESSAGE,
+                    ex.getClass().getName(), sinkRecord.topic(), sinkRecord.kafkaPartition(), sinkRecord.kafkaOffset());
+            log.debug(FILE_EXCEPTION_MESSAGE, ex);
             sendFailedRecordToDlq(sinkRecord);
         } else {
             log.debug(FILE_EXCEPTION_MESSAGE, ex);
