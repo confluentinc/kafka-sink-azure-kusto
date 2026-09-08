@@ -542,8 +542,8 @@ public class KustoSinkTask extends SinkTask {
                 throw e;
             }
             if (sinkRecord.value() == null) {
-                log.warn("Filtering null value (tombstone) records at offset {}, key {} and partition {} ",
-                        sinkRecord.kafkaOffset(), sinkRecord.key(), sinkRecord.kafkaPartition());
+                log.warn("Filtering null value (tombstone) records at topic {}, offset {} and partition {} ",
+                        sinkRecord.topic(), sinkRecord.kafkaOffset(), sinkRecord.kafkaPartition());
             } else {
                 writer.writeRecord(sinkRecord);
             }

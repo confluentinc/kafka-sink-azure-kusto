@@ -41,13 +41,20 @@ public class AvroRecordWriterProvider implements RecordWriterProvider {
                         throw new ConnectException(e);
                     }
                 }
-                Object value = avroData.fromConnectData(schema, record.value());
-                // AvroData wraps primitive types so their schema can be included. We need to unwrap
-                // NonRecordContainers to just their value to properly handle these types
-                if (value instanceof NonRecordContainer container) {
-                    writer.append(container.getValue());
-                } else {
-                    writer.append(value);
+                try {
+                    Object value = avroData.fromConnectData(schema, record.value());
+                    // AvroData wraps primitive types so their schema can be included. We need to unwrap
+                    // NonRecordContainers to just their value to properly handle these types
+                    if (value instanceof NonRecordContainer container) {
+                        writer.append(container.getValue());
+                    } else {
+                        writer.append(value);
+                    }
+                } catch (RuntimeException e) {
+                    throw new DataException(String.format(
+                            "Failed to serialize record to Avro (schema/type mismatch): topic=%s partition=%s offset=%s schema=%s cause=%s",
+                            record.topic(), record.kafkaPartition(), record.kafkaOffset(),
+                            schema == null ? "unknown" : schema.name(), e.getClass().getName()));
                 }
             }
 

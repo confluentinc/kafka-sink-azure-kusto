@@ -194,7 +194,8 @@ public class FileWriter implements Closeable {
         if (KustoSinkConfig.BehaviorOnError.FAIL == behaviorOnError) {
             throw new ConnectException(message, e);
         } else if (KustoSinkConfig.BehaviorOnError.LOG == behaviorOnError) {
-            log.error("{}", message, e);
+            log.error("{} Exception type: {}", message, e.getClass().getName());
+            log.debug("{}", message, e);
         } else {
             log.debug("{}", message, e);
         }
@@ -272,7 +273,8 @@ public class FileWriter implements Closeable {
             String fileName = currentFile == null ? "[no file created yet]" : currentFile.file.getName();
             long currentSize = currentFile == null ? 0 : currentFile.rawBytes;
             flushError = "Error in flushByTime. Current file: %s, size: %d. ".formatted(fileName, currentSize);
-            log.error(flushError, e);
+            log.error("{} Exception type: {}", flushError, e.getClass().getName());
+            log.debug("{}", flushError, e);
         }
     }
 

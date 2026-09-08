@@ -43,13 +43,15 @@ public class JsonRecordWriterProvider implements RecordWriterProvider {
 
                 @Override
                 public void write(SinkRecord record) {
-                    log.trace("Sink record: {}", record);
+                    log.trace("Writing sink record at topic={} partition={} offset={}",
+                            record.topic(), record.kafkaPartition(), record.kafkaOffset());
                     try {
                         Object value = record.value();
                         if (value instanceof Struct) {
                             byte[] rawJson = converter.fromConnectData(record.topic(), record.valueSchema(), value);
                             if (rawJson == null || rawJson.length == 0) {
-                                log.warn("Filtering empty records post-serialization. Record filtered {}", record); // prints everything
+                                log.warn("Filtering empty record post-serialization at topic={} partition={} offset={}",
+                                        record.topic(), record.kafkaPartition(), record.kafkaOffset());
                             } else {
                                 out.write(rawJson);
                                 out.write(LINE_SEPARATOR_BYTES);
