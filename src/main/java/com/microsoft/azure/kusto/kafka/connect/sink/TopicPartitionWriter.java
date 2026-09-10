@@ -16,6 +16,7 @@ import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -52,6 +53,7 @@ public class TopicPartitionWriter {
     private final Producer<byte[], byte[]> dlqProducer;
     private final BehaviorOnError behaviorOnError;
     private final KustoSinkMetrics metrics;
+    private final ErrantRecordReporter reporter;
     FileWriter fileWriter;
     long currentOffset;
     Long lastCommittedOffset;
@@ -59,12 +61,18 @@ public class TopicPartitionWriter {
 
     TopicPartitionWriter(TopicPartition tp, IngestClient client, TopicIngestionProperties ingestionProps,
             @NotNull KustoSinkConfig config, boolean isDlqEnabled, String dlqTopicName, Producer<byte[], byte[]> dlqProducer) {
-        this(tp, client, ingestionProps, config, isDlqEnabled, dlqTopicName, dlqProducer, null);
+        this(tp, client, ingestionProps, config, isDlqEnabled, dlqTopicName, dlqProducer, null, null);
     }
 
     TopicPartitionWriter(TopicPartition tp, IngestClient client, TopicIngestionProperties ingestionProps,
             @NotNull KustoSinkConfig config, boolean isDlqEnabled, String dlqTopicName, Producer<byte[], byte[]> dlqProducer,
             KustoSinkMetrics metrics) {
+        this(tp, client, ingestionProps, config, isDlqEnabled, dlqTopicName, dlqProducer, metrics, null);
+    }
+
+    TopicPartitionWriter(TopicPartition tp, IngestClient client, TopicIngestionProperties ingestionProps,
+            @NotNull KustoSinkConfig config, boolean isDlqEnabled, String dlqTopicName, Producer<byte[], byte[]> dlqProducer,
+            KustoSinkMetrics metrics, ErrantRecordReporter reporter) {
         this.tp = tp;
         this.client = client;
         this.ingestionProps = ingestionProps;
@@ -80,6 +88,7 @@ public class TopicPartitionWriter {
         this.dlqTopicName = dlqTopicName;
         this.dlqProducer = dlqProducer;
         this.metrics = metrics;
+        this.reporter = reporter;
     }
 
     static @NotNull String getTempDirectoryName(String tempDirPath) {
@@ -187,10 +196,10 @@ public class TopicPartitionWriter {
             try {
                 TimeUnit.MILLISECONDS.sleep(sleepTimeMs);
             } catch (InterruptedException interruptedErr) {
-                if (isDlqEnabled && behaviorOnError != BehaviorOnError.FAIL) {
-                    log.warn("Interrupted: Writing {} failed records to miscellaneous dead-letter " +
-                            "queue topic={}", fileDescriptor.records.size(), dlqTopicName);
-                    fileDescriptor.records.forEach(this::sendFailedRecordToDlq);
+                if (behaviorOnError != BehaviorOnError.FAIL) {
+                    log.warn("Interrupted: routing {} failed records to the dead-letter queue",
+                            fileDescriptor.records.size());
+                    fileDescriptor.records.forEach(record -> reportFailed(record, exception));
                 }
                 throw new ConnectException("Retrying ingesting records into KustoDB was interrupted after retryAttempts=%s".formatted(retryAttempts + 1),
                         exception);
@@ -199,18 +208,34 @@ public class TopicPartitionWriter {
             if (metrics != null) {
                 metrics.incrementIngestionFailures();
             }
-            if (isDlqEnabled && behaviorOnError != BehaviorOnError.FAIL) {
-                log.warn("Writing {} failed records to miscellaneous dead-letter " +
-                        "queue topic={}. Retry attempt {} of {}",
-                        fileDescriptor.records.size(), dlqTopicName, retryAttempts, maxRetryAttempts);
-                fileDescriptor.records.forEach(this::sendFailedRecordToDlq);
+            if (behaviorOnError != BehaviorOnError.FAIL) {
+                log.warn("Routing {} failed records to the dead-letter queue. Retry attempt {} of {}",
+                        fileDescriptor.records.size(), retryAttempts, maxRetryAttempts);
+                fileDescriptor.records.forEach(record -> reportFailed(record, exception));
             }
             throw new ConnectException("Retry attempts exhausted, failed to ingest records into KustoDB.",
                     exception);
         }
     }
 
+    void reportFailed(SinkRecord sinkRecord, Throwable exception) {
+        if (isDlqEnabled) {
+            sendFailedRecordToDlq(sinkRecord);
+        } else if (reporter != null) {
+            if (metrics != null) {
+                metrics.incrementDlqRecordsSent();
+            }
+            reporter.report(sinkRecord, exception);
+        }
+    }
+
     public void sendFailedRecordToDlq(@NotNull SinkRecord sinkRecord) {
+        if (dlqProducer == null) {
+            log.warn("Miscellaneous dead-letter queue producer is not configured; dropping failed record "
+                    + "at topic={} partition={} offset={}",
+                    sinkRecord.topic(), sinkRecord.kafkaPartition(), sinkRecord.kafkaOffset());
+            return;
+        }
         if (metrics != null) {
             metrics.incrementDlqRecordsSent();
         }
@@ -268,11 +293,15 @@ public class TopicPartitionWriter {
             log.error("{} exceptionType={}, topic={}, partition={}, offset={}", FILE_EXCEPTION_MESSAGE,
                     ex.getClass().getName(), sinkRecord.topic(), sinkRecord.kafkaPartition(), sinkRecord.kafkaOffset());
             log.debug(FILE_EXCEPTION_MESSAGE, ex);
-            sendFailedRecordToDlq(sinkRecord);
+            reportFailed(sinkRecord, ex);
         } else {
             log.debug(FILE_EXCEPTION_MESSAGE, ex);
-            sendFailedRecordToDlq(sinkRecord);
+            reportFailed(sinkRecord, ex);
         }
+    }
+
+    boolean isDlqRoutingEnabled() {
+        return isDlqEnabled || reporter != null;
     }
 
     void open() {
@@ -286,7 +315,7 @@ public class TopicPartitionWriter {
                 reentrantReadWriteLock,
                 ingestionProps.ingestionProperties.getDataFormat(),
                 behaviorOnError,
-                isDlqEnabled);
+                isDlqRoutingEnabled());
     }
 
     void close() {
