@@ -29,6 +29,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.NotFoundException;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.jetbrains.annotations.NotNull;
@@ -63,6 +64,7 @@ public class KustoSinkTask extends SinkTask {
     private boolean isDlqEnabled;
     private String dlqTopicName;
     private Producer<byte[], byte[]> dlqProducer;
+    private ErrantRecordReporter reporter;
 
     public KustoSinkTask() {
         assignment = new HashSet<>();
@@ -437,7 +439,7 @@ public class KustoSinkTask extends SinkTask {
             } else {
                 IngestClient client = ingestionProps.streaming ? streamingIngestClient : kustoIngestClient;
                 TopicPartitionWriter writer = new TopicPartitionWriter(tp, client, ingestionProps, config, isDlqEnabled,
-                        dlqTopicName, dlqProducer, metrics);
+                        dlqTopicName, dlqProducer, metrics, reporter);
                 writer.open();
                 writers.put(tp, writer);
             }
@@ -489,6 +491,12 @@ public class KustoSinkTask extends SinkTask {
             dlqProducer = null;
             isDlqEnabled = false;
             dlqTopicName = null;
+        }
+
+        try {
+            reporter = context != null ? context.errantRecordReporter() : null;
+        } catch (NoSuchMethodError | NoClassDefFoundError e) {
+            reporter = null;
         }
 
         topicsToIngestionProps = getTopicsToIngestionProps(config);
