@@ -6,6 +6,7 @@ import static org.mockito.Mockito.*;
 
 import com.microsoft.azure.kusto.ingest.IngestClient;
 import com.microsoft.azure.kusto.ingest.IngestionProperties;
+import com.microsoft.azure.kusto.ingest.exceptions.IngestionServiceException;
 import com.microsoft.azure.kusto.ingest.source.FileSourceInfo;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -27,6 +28,8 @@ import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -355,6 +358,94 @@ public class TopicPartitionWriterTest {
 
         Assertions.assertEquals(expected, history);
 
+    }
+
+    @Test
+    public void reportFailedRoutesToReporterWhenNoMiscDlq() {
+        ErrantRecordReporter reporter = mock(ErrantRecordReporter.class);
+        TopicPartitionWriter writer = new TopicPartitionWriter(tp, mockClient, propsCsv, config,
+                false, null, null, null, reporter);
+        SinkRecord record = new SinkRecord(tp.topic(), tp.partition(), null, null, Schema.STRING_SCHEMA, "v", 7);
+        Throwable cause = new RuntimeException("ingest failed");
+
+        writer.reportFailed(record, cause);
+
+        verify(reporter, times(1)).report(record, cause);
+    }
+
+    @Test
+    public void reportFailedPrefersMiscDlqWhenConfigured() {
+        ErrantRecordReporter reporter = mock(ErrantRecordReporter.class);
+        TopicPartitionWriter writer = new TopicPartitionWriter(tp, mockClient, propsCsv, config,
+                true, "dlq.topic.name", dlqMockProducer, null, reporter);
+        SinkRecord record = new SinkRecord(tp.topic(), tp.partition(), null, null, Schema.STRING_SCHEMA, "v", 8);
+
+        writer.reportFailed(record, new RuntimeException("ingest failed"));
+
+        Assertions.assertEquals(1, dlqMockProducer.history().size());
+        verify(reporter, never()).report(any(), any());
+    }
+
+    @Test
+    public void sendFailedRecordToDlqDoesNotThrowWhenProducerIsNull() {
+        TopicPartitionWriter writer = new TopicPartitionWriter(tp, mockClient, propsCsv, config,
+                false, null, null, null, null);
+        SinkRecord record = new SinkRecord(tp.topic(), tp.partition(), null, null, Schema.STRING_SCHEMA, "v", 9);
+
+        Assertions.assertDoesNotThrow(() -> writer.sendFailedRecordToDlq(record));
+    }
+
+    @Test
+    public void reportFailedDropsWhenNoDlqTargetAvailable() {
+        TopicPartitionWriter writer = new TopicPartitionWriter(tp, mockClient, propsCsv, config,
+                false, null, null, null, null);
+        SinkRecord record = new SinkRecord(tp.topic(), tp.partition(), null, null, Schema.STRING_SCHEMA, "v", 10);
+
+        Assertions.assertDoesNotThrow(() -> writer.reportFailed(record, new RuntimeException("x")));
+    }
+
+    @Test
+    public void isDlqRoutingEnabledCoversMiscAndReporter() {
+        ErrantRecordReporter reporter = mock(ErrantRecordReporter.class);
+        Assertions.assertTrue(new TopicPartitionWriter(tp, mockClient, propsCsv, config,
+                false, null, null, null, reporter).isDlqRoutingEnabled(), "reporter only (Fully-Managed)");
+        Assertions.assertTrue(new TopicPartitionWriter(tp, mockClient, propsCsv, config,
+                true, "dlq.topic.name", dlqMockProducer, null, null).isDlqRoutingEnabled(), "misc DLQ only");
+        Assertions.assertFalse(new TopicPartitionWriter(tp, mockClient, propsCsv, config,
+                false, null, null, null, null).isDlqRoutingEnabled(), "neither target");
+    }
+
+    @Test
+    public void ingestFailureRoutesWholeBatchToDlqReporter() throws Exception {
+        IngestClient failingClient = mock(IngestClient.class);
+        when(failingClient.ingestFromFile(any(), any())).thenThrow(mock(IngestionServiceException.class));
+
+        Map<String, String> settings = getKustoConfigs(basePathCurrent, fileThreshold, flushInterval);
+        settings.put(KustoSinkConfig.KUSTO_BEHAVIOR_ON_ERROR_CONF, "LOG");
+        settings.put(KustoSinkConfig.KUSTO_SINK_MAX_RETRY_TIME_MS_CONF, "20");
+        settings.put(KustoSinkConfig.KUSTO_SINK_RETRY_BACKOFF_TIME_MS_CONF, "10");
+        KustoSinkConfig logConfig = new KustoSinkConfig(settings);
+
+        ErrantRecordReporter reporter = mock(ErrantRecordReporter.class);
+        TopicIngestionProperties props = new TopicIngestionProperties();
+        props.ingestionProperties = new IngestionProperties(DATABASE, TABLE);
+        TopicPartitionWriter writer = new TopicPartitionWriter(tp, failingClient, props, logConfig,
+                false, null, null, null, reporter);
+
+        SourceFile descriptor = new SourceFile();
+        descriptor.rawBytes = 1024;
+        SinkRecord r1 = new SinkRecord(tp.topic(), tp.partition(), null, null, Schema.STRING_SCHEMA, "a", 1);
+        SinkRecord r2 = new SinkRecord(tp.topic(), tp.partition(), null, null, Schema.STRING_SCHEMA, "b", 2);
+        SinkRecord r3 = new SinkRecord(tp.topic(), tp.partition(), null, null, Schema.STRING_SCHEMA, "c", 3);
+        descriptor.records.add(r1);
+        descriptor.records.add(r2);
+        descriptor.records.add(r3);
+
+        assertThrows(ConnectException.class, () -> writer.handleRollFile(descriptor));
+
+        verify(reporter, times(1)).report(eq(r1), any(Throwable.class));
+        verify(reporter, times(1)).report(eq(r2), any(Throwable.class));
+        verify(reporter, times(1)).report(eq(r3), any(Throwable.class));
     }
 
     private Map<String, String> getKustoConfigs(String basePath, long fileThreshold, long flushInterval) {
