@@ -10,6 +10,11 @@
     <description>A Kafka Connect plugin for Azure Data Explorer (Kusto) Database</description>
     <version>5.3.4</version>
     <properties>
+        <!-- Reported by KustoSinkConnector.version() and KustoSinkTask.version() (plugin.version in
+             azure-kusto-kafka-sink-version.properties). Defaults to this pom's version; a build that
+             packages the connector under a different release version can override it with
+             -Dconnector.plugin.version=<version>, so the connector and task report that version. -->
+        <connector.plugin.version>${project.version}</connector.plugin.version>
         <!-- Compile dependencies -->
         <az.core.version>1.57.0</az.core.version>
         <az.core.http.netty.version>1.16.2</az.core.http.netty.version>
