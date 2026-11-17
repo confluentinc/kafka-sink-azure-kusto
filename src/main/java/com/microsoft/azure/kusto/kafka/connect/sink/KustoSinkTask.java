@@ -424,7 +424,7 @@ public class KustoSinkTask extends SinkTask {
 
     @Override
     public String version() {
-        return Version.getVersion();
+        return Version.getPluginVersion();
     }
 
     @Override

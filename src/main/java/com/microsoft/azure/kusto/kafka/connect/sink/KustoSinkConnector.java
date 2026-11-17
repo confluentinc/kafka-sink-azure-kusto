@@ -54,6 +54,6 @@ public class KustoSinkConnector extends SinkConnector {
 
     @Override
     public String version() {
-        return Version.getVersion();
+        return Version.getPluginVersion();
     }
 }
